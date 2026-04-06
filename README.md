@@ -373,3 +373,7 @@ Live packet capture requires elevated privileges:
 - `chart.js` + `react-chartjs-2` — Data visualization
 - `vite` — Build tool
 wert
+
+## License
+
+This project is licensed under the MIT License.
