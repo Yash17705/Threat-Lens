@@ -11,6 +11,7 @@ const cors     = require("cors");
 const morgan   = require("morgan");
 const axios    = require("axios");
 const mongoose = require("mongoose");
+const nodemailer = require("nodemailer");
 const fs = require("fs");
 const path = require("path");
 const { spawn } = require("child_process");
@@ -20,11 +21,181 @@ const { v4: uuidv4 } = require("uuid");
 const PORT       = process.env.PORT           || 3001;
 const ML_URL     = process.env.ML_SERVICE_URL || "http://localhost:8000";
 const MONGO_URI  = process.env.MONGODB_URI    || "mongodb://localhost:27017/nids";
+const ALERT_CATEGORIES = (process.env.ALERT_CRITICAL_CATEGORIES || "dos,u2r")
+  .split(",")
+  .map((value) => value.trim().toLowerCase())
+  .filter(Boolean);
+const ALERT_COOLDOWN_MS = Math.max(0, Number(process.env.ALERT_COOLDOWN_MS) || 5 * 60 * 1000);
+const EMAIL_ALERTS_ENABLED = String(process.env.EMAIL_ALERTS_ENABLED || "").toLowerCase() === "true";
 
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: "5mb" }));
 app.use(morgan("tiny"));
+
+// ── Alert integrations ───────────────────────────────────────────────────────
+const alertCooldowns = new Map();
+const mailTransport = EMAIL_ALERTS_ENABLED
+  && process.env.SMTP_HOST
+  && process.env.SMTP_USER
+  && process.env.SMTP_PASS
+  && process.env.EMAIL_FROM
+  && process.env.EMAIL_TO
+  ? nodemailer.createTransport({
+      host: process.env.SMTP_HOST,
+      port: Number(process.env.SMTP_PORT) || 587,
+      secure: String(process.env.SMTP_SECURE || "").toLowerCase() === "true",
+      auth: {
+        user: process.env.SMTP_USER,
+        pass: process.env.SMTP_PASS,
+      },
+    })
+  : null;
+
+function getAlertTargets() {
+  return {
+    email: !!mailTransport,
+    slack: !!process.env.SLACK_WEBHOOK_URL,
+    discord: !!process.env.DISCORD_WEBHOOK_URL,
+    telegram: !!(process.env.TELEGRAM_BOT_TOKEN && process.env.TELEGRAM_CHAT_ID),
+  };
+}
+
+function getAlertStatus() {
+  const targets = getAlertTargets();
+  const activeChannels = Object.entries(targets)
+    .filter(([, enabled]) => enabled)
+    .map(([name]) => name);
+
+  return {
+    enabled: activeChannels.length > 0,
+    active_channels: activeChannels,
+    targets,
+    cooldown_ms: ALERT_COOLDOWN_MS,
+    critical_categories: ALERT_CATEGORIES,
+  };
+}
+
+function isCriticalAlert(result) {
+  return !!(result && result.is_attack && ALERT_CATEGORIES.includes(String(result.attack_category || "").toLowerCase()));
+}
+
+function buildAlertSignature(log) {
+  return [
+    String(log.attack_category || "unknown").toLowerCase(),
+    log.prediction || "unknown",
+    log.protocol || "unknown",
+  ].join("|");
+}
+
+function shouldDispatchAlert(log) {
+  const signature = buildAlertSignature(log);
+  const now = Date.now();
+  const lastSentAt = alertCooldowns.get(signature) || 0;
+
+  if (now - lastSentAt < ALERT_COOLDOWN_MS) {
+    return false;
+  }
+
+  alertCooldowns.set(signature, now);
+
+  if (alertCooldowns.size > 2000) {
+    const expiry = now - ALERT_COOLDOWN_MS * 2;
+    for (const [key, timestamp] of alertCooldowns.entries()) {
+      if (timestamp < expiry) alertCooldowns.delete(key);
+    }
+  }
+
+  return true;
+}
+
+function buildAlertPayload(log) {
+  const category = String(log.attack_category || "unknown").toUpperCase();
+  const confidence = typeof log.confidence === "number" ? `${log.confidence.toFixed(1)}%` : "n/a";
+  const title = `[NIDS] ${category} threat detected`;
+  const lines = [
+    `Prediction: ${log.prediction || "unknown"}`,
+    `Category: ${category}`,
+    `Confidence: ${confidence}`,
+    `Source: ${log.src_ip || "unknown"}:${log.src_port || 0}`,
+    `Destination: ${log.dst_ip || "unknown"}:${log.dst_port || 0}`,
+    `Protocol: ${log.protocol || "unknown"}`,
+    `Packet Length: ${log.packet_length || 0}`,
+    `Model: ${log.model_used || "unknown"}`,
+    `Time: ${new Date(log.timestamp).toISOString()}`,
+  ];
+
+  return {
+    title,
+    text: lines.join("\n"),
+    html: `
+      <h2>${title}</h2>
+      <ul>
+        ${lines.map((line) => `<li>${line}</li>`).join("")}
+      </ul>
+    `,
+    lines,
+  };
+}
+
+async function sendEmailAlert(payload) {
+  if (!mailTransport) return;
+
+  await mailTransport.sendMail({
+    from: process.env.EMAIL_FROM,
+    to: process.env.EMAIL_TO,
+    subject: payload.title,
+    text: payload.text,
+    html: payload.html,
+  });
+}
+
+async function sendSlackAlert(payload) {
+  if (!process.env.SLACK_WEBHOOK_URL) return;
+
+  await axios.post(process.env.SLACK_WEBHOOK_URL, {
+    text: `${payload.title}\n${payload.text}`,
+  }, { timeout: 5000 });
+}
+
+async function sendDiscordAlert(payload) {
+  if (!process.env.DISCORD_WEBHOOK_URL) return;
+
+  await axios.post(process.env.DISCORD_WEBHOOK_URL, {
+    content: `${payload.title}\n${payload.text}`,
+  }, { timeout: 5000 });
+}
+
+async function sendTelegramAlert(payload) {
+  const token = process.env.TELEGRAM_BOT_TOKEN;
+  const chatId = process.env.TELEGRAM_CHAT_ID;
+  if (!token || !chatId) return;
+
+  await axios.post(`https://api.telegram.org/bot${token}/sendMessage`, {
+    chat_id: chatId,
+    text: `${payload.title}\n${payload.text}`,
+  }, { timeout: 5000 });
+}
+
+async function dispatchAlerts(log) {
+  const alertStatus = getAlertStatus();
+  if (!alertStatus.enabled || !isCriticalAlert(log) || !shouldDispatchAlert(log)) return;
+
+  const payload = buildAlertPayload(log);
+  const operations = [
+    ["email", sendEmailAlert(payload)],
+    ["slack", sendSlackAlert(payload)],
+    ["discord", sendDiscordAlert(payload)],
+    ["telegram", sendTelegramAlert(payload)],
+  ];
+
+  const results = await Promise.allSettled(operations.map(([, promise]) => promise));
+  results.forEach((result, index) => {
+    if (result.status === "rejected") {
+      console.error(`alert delivery failed (${operations[index][0]}):`, result.reason?.message || result.reason);
+    }
+  });
+}
 
 // ── Demo simulator process ───────────────────────────────────────────────────
 const ROOT_DIR = path.resolve(__dirname, "..");
@@ -240,6 +411,10 @@ async function callML(features) {
 // Health
 app.get("/health", (_req, res) => res.json({ status: "ok", mongo: usingMongo }));
 
+app.get("/api/alerts/status", (_req, res) => {
+  res.json(getAlertStatus());
+});
+
 // ── POST /api/analyze — receive packet + classify ─────────────────────────────
 app.post("/api/analyze", async (req, res) => {
   try {
@@ -279,6 +454,9 @@ app.post("/api/analyze", async (req, res) => {
     };
 
     await storeLog(log);
+    dispatchAlerts(log).catch((err) => {
+      console.error("alert dispatch error:", err.message);
+    });
 
     res.json({ success: true, result, log_id: log.id });
   } catch (err) {
@@ -379,4 +557,6 @@ app.listen(PORT, () => {
   console.log(`\n🛡️  NIDS Backend running on http://localhost:${PORT}`);
   console.log(`   ML Service : ${ML_URL}`);
   console.log(`   Storage    : ${usingMongo ? "MongoDB" : "in-memory"}\n`);
+  const alertStatus = getAlertStatus();
+  console.log(`   Alerts     : ${alertStatus.enabled ? alertStatus.active_channels.join(", ") : "disabled"}\n`);
 });

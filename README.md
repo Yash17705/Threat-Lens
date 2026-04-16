@@ -263,6 +263,55 @@ Manual download (if auto-download fails):
 | `/api/stats` | GET | Current counters |
 | `/api/stats/history` | GET | 30-min time series |
 | `/api/logs` | DELETE | Clear all logs |
+| `/api/alerts/status` | GET | Alert integration status |
+
+---
+
+## 🔔 Alert Integrations
+
+The backend can send **critical detections** to external channels when
+`attack_category` matches `ALERT_CRITICAL_CATEGORIES` (defaults to `dos,u2r`).
+Duplicate alerts are rate-limited using `ALERT_COOLDOWN_MS` (defaults to 5 min).
+
+Configure any combination of these in `server/.env`:
+
+```env
+# Critical categories and dedupe cooldown
+ALERT_CRITICAL_CATEGORIES=dos,u2r
+ALERT_COOLDOWN_MS=300000
+
+# Email via SMTP
+EMAIL_ALERTS_ENABLED=true
+SMTP_HOST=smtp.gmail.com
+SMTP_PORT=587
+SMTP_SECURE=false
+SMTP_USER=your-email@example.com
+SMTP_PASS=your-app-password
+EMAIL_FROM=your-email@example.com
+EMAIL_TO=security-team@example.com
+
+# Slack
+SLACK_WEBHOOK_URL=https://hooks.slack.com/services/...
+
+# Discord
+DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/...
+
+# Telegram
+TELEGRAM_BOT_TOKEN=123456789:bot_token_here
+TELEGRAM_CHAT_ID=123456789
+```
+
+Notes:
+- Email requires SMTP credentials. For Gmail, use an app password rather than your main password.
+- Slack and Discord use incoming webhook URLs.
+- Telegram requires a bot token and a target chat ID.
+- Alert delivery runs in the backend after `/api/analyze`, so the dashboard still works even if a channel is misconfigured.
+
+Quick check:
+
+```bash
+curl http://localhost:3001/api/alerts/status
+```
 
 ---
 
@@ -279,6 +328,7 @@ curl -X POST http://localhost:8000/predict \
 ```bash
 curl http://localhost:3001/api/stats
 curl http://localhost:3001/api/logs?limit=10
+curl http://localhost:3001/api/alerts/status
 ```
 
 ### Simulate a Neptune (DoS) attack:
