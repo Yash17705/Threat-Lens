@@ -17,6 +17,7 @@ import socket
 import struct
 import requests
 import threading
+from collections import defaultdict, deque
 from datetime import datetime
 from typing import Optional
 
@@ -27,6 +28,61 @@ COMMON_PORTS = [20, 21, 22, 23, 25, 53, 80, 110, 143, 443,
                 445, 3306, 3389, 5432, 8080, 8443, 27017]
 
 PROTOCOLS = ["TCP", "UDP", "ICMP"]
+
+TCP_SERVICE_MAP = {
+    7: "echo",
+    9: "discard",
+    13: "daytime",
+    20: "ftp_data",
+    21: "ftp",
+    22: "ssh",
+    23: "telnet",
+    25: "smtp",
+    37: "time",
+    43: "whois",
+    53: "domain",
+    70: "gopher",
+    79: "finger",
+    80: "http",
+    109: "pop_2",
+    110: "pop_3",
+    111: "sunrpc",
+    113: "auth",
+    119: "nntp",
+    137: "netbios_ns",
+    139: "netbios_ssn",
+    143: "imap4",
+    179: "bgp",
+    443: "http_443",
+    512: "exec",
+    513: "login",
+    514: "shell",
+    515: "printer",
+    540: "uucp",
+    543: "klogin",
+    544: "kshell",
+    6000: "X11",
+    6667: "IRC",
+    8001: "http_8001",
+}
+
+UDP_SERVICE_MAP = {
+    7: "echo",
+    9: "discard",
+    13: "daytime",
+    37: "time",
+    53: "domain_u",
+    69: "tftp_u",
+    111: "sunrpc",
+    123: "ntp_u",
+    137: "netbios_ns",
+    138: "netbios_dgm",
+    139: "netbios_ssn",
+}
+
+AUTH_SERVICES = {"auth", "ftp", "imap4", "login", "pop_2", "pop_3", "smtp", "ssh", "telnet"}
+RECENT_WINDOW_SEC = 2.0
+FAILED_LOGIN_WINDOW_SEC = 30.0
 
 NORMAL_PROFILES = [
     {
@@ -249,6 +305,59 @@ def add_network_meta(features: dict) -> dict:
     return features
 
 
+def infer_service_name(pkt, proto_name: str, sport: int, dport: int) -> str:
+    if proto_name == "icmp":
+        icmp_type = int(getattr(pkt["ICMP"], "type", -1))
+        icmp_code = int(getattr(pkt["ICMP"], "code", 0))
+        if icmp_type == 0:
+            return "ecr_i"
+        if icmp_type == 5:
+            return "red_i"
+        if icmp_type == 8:
+            return "eco_i"
+        if icmp_type == 11:
+            return "tim_i"
+        if icmp_type == 3:
+            return "urh_i" if icmp_code == 1 else "urp_i"
+        return "eco_i"
+
+    port_map = TCP_SERVICE_MAP if proto_name == "tcp" else UDP_SERVICE_MAP
+    for port in (dport, sport):
+        if port in port_map:
+            return port_map[port]
+
+    if dport < 1024 or sport < 1024:
+        return "other"
+    return "private"
+
+
+def infer_flag_name(proto_name: str, raw_flags: str) -> str:
+    if proto_name != "tcp":
+        return "SF"
+
+    flags = set(raw_flags or "")
+    if "R" in flags and "S" in flags and "A" not in flags:
+        return "RSTOS0"
+    if "R" in flags and "A" in flags:
+        return "RSTR"
+    if "R" in flags:
+        return "REJ"
+    if "S" in flags and "A" not in flags:
+        return "S0"
+    if "S" in flags and "A" in flags:
+        return "S1"
+    if "H" in flags and "A" not in flags:
+        return "SH"
+    if "F" in flags or "P" in flags or "A" in flags:
+        return "SF"
+    return "OTH"
+
+
+def trim_recent(history: deque, cutoff: float):
+    while history and history[0][0] < cutoff:
+        history.popleft()
+
+
 # ── Send to backend ───────────────────────────────────────────────────────────
 def send_packet(features: dict, verbose: bool = True):
     try:
@@ -316,68 +425,183 @@ def live_capture(interface: Optional[str], packet_count: int):
         print("✗  Scapy not installed. Run: pip install scapy")
         return
 
-    connection_tracker: dict = {}
+    flow_tracker: dict = {}
+    recent_host_pairs = defaultdict(deque)
+    recent_host_pair_services = defaultdict(deque)
+    recent_src_services = defaultdict(deque)
+    dst_host_history = defaultdict(lambda: deque(maxlen=100))
+    dst_host_service_history = defaultdict(lambda: deque(maxlen=100))
+    recent_login_failures = defaultdict(deque)
 
     def scapy_to_features(pkt) -> Optional[dict]:
         if not pkt.haslayer("IP"):
             return None
 
         ip = pkt["IP"]
-        proto = 1  # TCP default
+        proto_name = "tcp"
+        proto_code = 1
+        raw_flags = "O"
 
         if pkt.haslayer("TCP"):
-            proto = 1
-            sport = pkt["TCP"].sport
-            dport = pkt["TCP"].dport
-            flags = str(pkt["TCP"].flags)
+            proto_name = "tcp"
+            proto_code = 1
+            sport = int(pkt["TCP"].sport)
+            dport = int(pkt["TCP"].dport)
+            raw_flags = str(pkt["TCP"].flags)
         elif pkt.haslayer("UDP"):
-            proto = 2
-            sport = pkt["UDP"].sport
-            dport = pkt["UDP"].dport
-            flags = "U"
+            proto_name = "udp"
+            proto_code = 2
+            sport = int(pkt["UDP"].sport)
+            dport = int(pkt["UDP"].dport)
+            raw_flags = "U"
         elif pkt.haslayer("ICMP"):
-            proto = 0
+            proto_name = "icmp"
+            proto_code = 0
             sport = 0
             dport = 0
-            flags = "I"
+            raw_flags = "I"
         else:
-            sport, dport, flags = 0, 0, "O"
+            sport, dport = 0, 0
 
+        now = time.time()
         pkt_len = len(pkt)
-        key = (ip.src, ip.dst, sport, dport)
-        conn = connection_tracker.get(key, {"count": 0, "serrors": 0, "bytes": 0})
-        conn["count"] += 1
-        conn["bytes"] += pkt_len
-        if "R" in flags or "S" in flags:
-            conn["serrors"] += 1
-        connection_tracker[key] = conn
+        service_name = infer_service_name(pkt, proto_name, sport, dport)
+        flag_name = infer_flag_name(proto_name, raw_flags)
+        wrong_fragment = 1 if int(getattr(ip, "frag", 0)) > 0 else 0
+        urgent = 1 if pkt.haslayer("TCP") and int(getattr(pkt["TCP"], "urgptr", 0)) > 0 else 0
+        is_serror = 1 if flag_name in {"S0", "RSTOS0"} else 0
+        is_rerror = 1 if flag_name in {"REJ", "RSTR", "RSTOS0"} else 0
 
-        count = conn["count"]
-        serr  = conn["serrors"] / count if count > 0 else 0
+        flow_key = (ip.src, ip.dst, sport, dport, proto_name)
+        reverse_key = (ip.dst, ip.src, dport, sport, proto_name)
+        flow = flow_tracker.setdefault(flow_key, {
+            "first_seen": now,
+            "last_seen": now,
+            "packets": 0,
+            "bytes": 0,
+            "serrors": 0,
+            "rerrors": 0,
+        })
+        reverse_flow = flow_tracker.get(reverse_key, {
+            "packets": 0,
+            "bytes": 0,
+            "serrors": 0,
+            "rerrors": 0,
+        })
+
+        flow["last_seen"] = now
+        flow["packets"] += 1
+        flow["bytes"] += pkt_len
+        flow["serrors"] += is_serror
+        flow["rerrors"] += is_rerror
+
+        pair_key = (ip.src, ip.dst)
+        pair_service_key = (ip.src, ip.dst, service_name)
+        src_service_key = (ip.src, service_name)
+        cutoff = now - RECENT_WINDOW_SEC
+
+        pair_history = recent_host_pairs[pair_key]
+        pair_service_history = recent_host_pair_services[pair_service_key]
+        src_service_history = recent_src_services[src_service_key]
+        trim_recent(pair_history, cutoff)
+        trim_recent(pair_service_history, cutoff)
+        trim_recent(src_service_history, cutoff)
+
+        count = min(len(pair_history) + 1, 511)
+        srv_count = min(len(pair_service_history) + 1, 511)
+        same_srv_rate = round(srv_count / max(count, 1), 2)
+        diff_srv_rate = round(max(0.0, 1.0 - same_srv_rate), 2)
+        unique_src_service_dsts = {dst for _, dst in src_service_history}
+        unique_src_service_dsts.add(ip.dst)
+        srv_diff_host_rate = round(
+            min(1.0, max(0.0, (len(unique_src_service_dsts) - 1) / max(len(src_service_history) + 1, 1))),
+            2,
+        )
+
+        dst_history = dst_host_history[ip.dst]
+        dst_service_history = dst_host_service_history[(ip.dst, service_name)]
+        dst_host_count = min(len(dst_history) + 1, 255)
+        dst_host_srv_count = min(len(dst_service_history) + 1, 255)
+        dst_host_same_srv_rate = round(dst_host_srv_count / max(dst_host_count, 1), 2)
+        dst_host_diff_srv_rate = round(max(0.0, 1.0 - dst_host_same_srv_rate), 2)
+
+        same_src_port_hits = sum(1 for _, hist_sport, _, _, _ in dst_history if hist_sport == sport) + 1
+        unique_service_sources = {src for src, _, _, _ in dst_service_history}
+        unique_service_sources.add(ip.src)
+        dst_host_same_src_port_rate = round(same_src_port_hits / max(dst_host_count, 1), 2)
+        dst_host_srv_diff_host_rate = round(
+            min(1.0, max(0.0, (len(unique_service_sources) - 1) / max(dst_host_srv_count, 1))),
+            2,
+        )
+
+        dst_host_serror_count = sum(hist_serr for _, _, _, hist_serr, _ in dst_history) + is_serror
+        dst_host_rerror_count = sum(hist_rerr for _, _, _, _, hist_rerr in dst_history) + is_rerror
+        dst_host_srv_serror_count = sum(hist_serr for _, _, hist_serr, _ in dst_service_history) + is_serror
+        dst_host_srv_rerror_count = sum(hist_rerr for _, _, _, hist_rerr in dst_service_history) + is_rerror
+
+        dst_host_serror_rate = round(dst_host_serror_count / max(dst_host_count, 1), 2)
+        dst_host_srv_serror_rate = round(dst_host_srv_serror_count / max(dst_host_srv_count, 1), 2)
+        dst_host_rerror_rate = round(dst_host_rerror_count / max(dst_host_count, 1), 2)
+        dst_host_srv_rerror_rate = round(dst_host_srv_rerror_count / max(dst_host_srv_count, 1), 2)
+
+        auth_key = (ip.src, ip.dst, service_name)
+        if service_name in AUTH_SERVICES:
+            failure_history = recent_login_failures[auth_key]
+            trim_recent(failure_history, now - FAILED_LOGIN_WINDOW_SEC)
+            if flag_name in {"S0", "REJ", "RSTR", "RSTOS0"}:
+                num_failed_logins = min(len(failure_history) + 1, 10)
+                failure_history.append((now,))
+            else:
+                num_failed_logins = len(failure_history)
+        else:
+            num_failed_logins = 0
+
+        logged_in = 1 if service_name in AUTH_SERVICES and flag_name == "SF" and reverse_flow["bytes"] > 0 else 0
+
+        pair_history.append((now, service_name))
+        pair_service_history.append((now, service_name))
+        src_service_history.append((now, ip.dst))
+        dst_history.append((service_name, sport, ip.src, is_serror, is_rerror))
+        dst_service_history.append((ip.src, sport, is_serror, is_rerror))
 
         return {
-            "duration":          0,
-            "protocol_type":     proto,
-            "service":           min(dport // 10, 60),
-            "flag":              0,
-            "src_bytes":         pkt_len,
-            "dst_bytes":         0,
-            "count":             min(count, 511),
-            "srv_count":         min(count, 511),
-            "serror_rate":       round(serr, 2),
-            "srv_serror_rate":   round(serr, 2),
-            "same_srv_rate":     1.0,
-            "diff_srv_rate":     0.0,
-            "dst_host_count":    1,
-            "dst_host_srv_count": 1,
-            "dst_host_same_srv_rate": 1.0,
+            "duration":          round(max(0.0, now - flow["first_seen"]), 3),
+            "protocol_type":     proto_name,
+            "service":           service_name,
+            "flag":              flag_name,
+            "src_bytes":         flow["bytes"],
+            "dst_bytes":         reverse_flow["bytes"],
+            "land":              1 if ip.src == ip.dst and sport == dport else 0,
+            "wrong_fragment":    wrong_fragment,
+            "urgent":            urgent,
+            "num_failed_logins": num_failed_logins,
+            "logged_in":         logged_in,
+            "count":             count,
+            "srv_count":         srv_count,
+            "serror_rate":       round(flow["serrors"] / max(flow["packets"], 1), 2),
+            "srv_serror_rate":   round((flow["serrors"] + reverse_flow["serrors"]) / max(flow["packets"] + reverse_flow["packets"], 1), 2),
+            "rerror_rate":       round(flow["rerrors"] / max(flow["packets"], 1), 2),
+            "srv_rerror_rate":   round((flow["rerrors"] + reverse_flow["rerrors"]) / max(flow["packets"] + reverse_flow["packets"], 1), 2),
+            "same_srv_rate":     same_srv_rate,
+            "diff_srv_rate":     diff_srv_rate,
+            "srv_diff_host_rate": srv_diff_host_rate,
+            "dst_host_count":    dst_host_count,
+            "dst_host_srv_count": dst_host_srv_count,
+            "dst_host_same_srv_rate": dst_host_same_srv_rate,
+            "dst_host_diff_srv_rate": dst_host_diff_srv_rate,
+            "dst_host_same_src_port_rate": dst_host_same_src_port_rate,
+            "dst_host_srv_diff_host_rate": dst_host_srv_diff_host_rate,
+            "dst_host_serror_rate": dst_host_serror_rate,
+            "dst_host_srv_serror_rate": dst_host_srv_serror_rate,
+            "dst_host_rerror_rate": dst_host_rerror_rate,
+            "dst_host_srv_rerror_rate": dst_host_srv_rerror_rate,
             # metadata
             "src_ip":            ip.src,
             "dst_ip":            ip.dst,
             "src_port":          sport,
             "dst_port":          dport,
             "packet_length":     pkt_len,
-            "protocol":          {1:"TCP",2:"UDP",0:"ICMP"}.get(proto,"TCP"),
+            "protocol":          {1:"TCP",2:"UDP",0:"ICMP"}.get(proto_code,"TCP"),
         }
 
     def handle_packet(pkt):

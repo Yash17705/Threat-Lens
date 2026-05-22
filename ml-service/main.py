@@ -7,7 +7,7 @@ import os
 import time
 import logging
 import numpy as np
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Union
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -99,9 +99,9 @@ def startup_event():
 class PacketFeatures(BaseModel):
     # Core features — all optional so partial packets are accepted
     duration:                    float = Field(0,    ge=0)
-    protocol_type:               float = Field(1,    ge=0, le=2)   # 0=icmp,1=tcp,2=udp
-    service:                     float = Field(0,    ge=0)
-    flag:                        float = Field(0,    ge=0)
+    protocol_type:               Union[float, str] = Field("tcp")
+    service:                     Union[float, str] = Field("private")
+    flag:                        Union[float, str] = Field("SF")
     src_bytes:                   float = Field(0,    ge=0)
     dst_bytes:                   float = Field(0,    ge=0)
     land:                        float = Field(0,    ge=0, le=1)
@@ -162,10 +162,63 @@ FEATURE_ORDER = [
     "protocol_type","service","flag"
 ]
 
+CATEGORICAL_DEFAULTS = {
+    "protocol_type": "tcp",
+    "service": "private",
+    "flag": "OTH",
+}
+
+
+def encode_categorical_value(field_name: str, value: Any) -> float:
+    if isinstance(value, (int, float, np.integer, np.floating)) and not isinstance(value, bool):
+        return float(value)
+
+    encoders = models.get("encoders")
+    if not encoders:
+        manual_protocol_map = {"icmp": 0.0, "tcp": 1.0, "udp": 2.0}
+        if field_name == "protocol_type":
+            return manual_protocol_map.get(str(value).strip().lower(), 1.0)
+        return 0.0
+
+    encoder_index = {"protocol_type": 0, "service": 1, "flag": 2}[field_name]
+    encoder = encoders[encoder_index]
+
+    text = str(value).strip() if value is not None else ""
+    if not text:
+        text = CATEGORICAL_DEFAULTS[field_name]
+
+    if field_name == "protocol_type":
+        candidates = [text.lower()]
+    elif field_name == "flag":
+        candidates = [text.upper()]
+    else:
+        candidates = [text, text.lower(), text.upper()]
+
+    selected = None
+    for candidate in candidates:
+        if candidate in encoder.classes_:
+            selected = candidate
+            break
+
+    if selected is None:
+        fallback = CATEGORICAL_DEFAULTS[field_name]
+        if fallback in encoder.classes_:
+            selected = fallback
+        else:
+            selected = encoder.classes_[0]
+
+    return float(encoder.transform([selected])[0])
+
 
 def packet_to_vector(pkt: PacketFeatures) -> np.ndarray:
     data = pkt.dict()
-    vec = [float(data.get(f, 0)) for f in FEATURE_ORDER]
+    vec = []
+    for field_name in FEATURE_ORDER:
+        value = data.get(field_name, 0)
+        if field_name in CATEGORICAL_DEFAULTS:
+            vec.append(encode_categorical_value(field_name, value))
+        else:
+            vec.append(float(value if value is not None else 0))
     return np.array(vec, dtype=np.float32).reshape(1, -1)
 
 

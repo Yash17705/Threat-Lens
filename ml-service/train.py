@@ -9,8 +9,8 @@ import pandas as pd
 import numpy as np
 from sklearn.ensemble import RandomForestClassifier, IsolationForest
 from sklearn.preprocessing import LabelEncoder, StandardScaler
-from sklearn.metrics import classification_report, accuracy_score
-from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report, accuracy_score, f1_score
+from sklearn.utils.class_weight import compute_sample_weight
 import joblib
 import warnings
 warnings.filterwarnings("ignore")
@@ -97,31 +97,59 @@ def load_data(filepath: str) -> pd.DataFrame:
     return df
 
 
-def preprocess(df: pd.DataFrame):
+def safe_transform(le: LabelEncoder, series: pd.Series, unknown_value: int = 0) -> np.ndarray:
+    """Transform with a fitted LabelEncoder, falling back for unseen values."""
+    values = series.astype(str)
+    known = set(le.classes_)
+    return np.array(
+        [le.transform([value])[0] if value in known else unknown_value for value in values],
+        dtype=np.int32,
+    )
+
+
+def preprocess(
+    df: pd.DataFrame,
+    encoders=None,
+    label_encoder: LabelEncoder = None,
+):
     # Map raw labels → category
     df = df.copy()
     df["category"] = df["label"].str.lower().map(ATTACK_MAP).fillna("unknown")
 
     # Encode categorical string features
-    le_proto   = LabelEncoder()
-    le_service = LabelEncoder()
-    le_flag    = LabelEncoder()
+    if encoders is None:
+        le_proto   = LabelEncoder()
+        le_service = LabelEncoder()
+        le_flag    = LabelEncoder()
 
-    df["protocol_type"] = le_proto.fit_transform(df["protocol_type"].astype(str))
-    df["service"]       = le_service.fit_transform(df["service"].astype(str))
-    df["flag"]          = le_flag.fit_transform(df["flag"].astype(str))
+        df["protocol_type"] = le_proto.fit_transform(df["protocol_type"].astype(str))
+        df["service"]       = le_service.fit_transform(df["service"].astype(str))
+        df["flag"]          = le_flag.fit_transform(df["flag"].astype(str))
+        encoders = (le_proto, le_service, le_flag)
+    else:
+        le_proto, le_service, le_flag = encoders
+        df["protocol_type"] = safe_transform(le_proto, df["protocol_type"])
+        df["service"]       = safe_transform(le_service, df["service"])
+        df["flag"]          = safe_transform(le_flag, df["flag"])
 
     all_features = NUMERIC_FEATURES + ["protocol_type", "service", "flag"]
     X = df[all_features].values.astype(np.float32)
 
     # Labels for multi-class classifier
-    le_label = LabelEncoder()
-    y_multi  = le_label.fit_transform(df["category"])
+    if label_encoder is None:
+        le_label = LabelEncoder()
+        y_multi  = le_label.fit_transform(df["category"])
+    else:
+        le_label = label_encoder
+        missing_labels = sorted(set(df["category"]) - set(le_label.classes_))
+        if missing_labels:
+            raise ValueError(f"Unseen label categories in evaluation data: {missing_labels}")
+        y_multi = le_label.transform(df["category"])
 
     # Labels for binary classifier (normal=0, attack=1)
     y_binary = (df["category"] != "normal").astype(int).values
 
-    return X, y_multi, y_binary, le_label, (le_proto, le_service, le_flag), all_features
+    return X, y_multi, y_binary, le_label, encoders, all_features
 
 
 def train_and_save():
@@ -143,17 +171,11 @@ def train_and_save():
     # 3. Preprocess
     print("\n[ 3/5 ] Preprocessing …")
     X_train, y_train_multi, y_train_bin, le_label, encoders, feature_names = preprocess(train_df)
-    X_test,  y_test_multi,  y_test_bin,  *_rest = preprocess(test_df)
-
-    # Re-encode test with training encoders
-    le_proto, le_service, le_flag = encoders
-
-    def safe_transform(le, series):
-        known = set(le.classes_)
-        return series.map(lambda x: le.transform([x])[0] if x in known else 0)
-
-    for df_ref, X_ref in [(test_df, X_test)]:
-        pass  # already encoded above via preprocess; acceptable for demo
+    X_test,  y_test_multi,  y_test_bin,  *_rest = preprocess(
+        test_df,
+        encoders=encoders,
+        label_encoder=le_label,
+    )
 
     scaler = StandardScaler()
     X_train_s = scaler.fit_transform(X_train)
@@ -167,23 +189,39 @@ def train_and_save():
 
     # Random Forest
     print("  → Random Forest …", end=" ", flush=True)
-    rf = RandomForestClassifier(n_estimators=100, max_depth=20, n_jobs=-1, random_state=42)
+    rf = RandomForestClassifier(
+        n_estimators=200,
+        max_depth=20,
+        class_weight="balanced_subsample",
+        n_jobs=-1,
+        random_state=42,
+    )
     rf.fit(X_train, y_train_multi)
-    rf_acc = accuracy_score(y_test_multi, rf.predict(X_test))
-    print(f"done  (test accuracy: {rf_acc*100:.2f}%)")
+    rf_preds = rf.predict(X_test)
+    rf_acc = accuracy_score(y_test_multi, rf_preds)
+    rf_f1 = f1_score(y_test_multi, rf_preds, average="macro")
+    print(f"done  (test accuracy: {rf_acc*100:.2f}%, macro F1: {rf_f1:.3f})")
 
     # XGBoost (optional)
     try:
         from xgboost import XGBClassifier
         print("  → XGBoost …", end=" ", flush=True)
+        sample_weight = compute_sample_weight(class_weight="balanced", y=y_train_multi)
         xgb = XGBClassifier(
-            n_estimators=200, max_depth=7, learning_rate=0.1,
+            n_estimators=350,
+            max_depth=8,
+            learning_rate=0.05,
+            subsample=0.9,
+            colsample_bytree=0.9,
+            min_child_weight=3,
             use_label_encoder=False, eval_metric="mlogloss",
             n_jobs=-1, random_state=42, verbosity=0
         )
-        xgb.fit(X_train, y_train_multi)
-        xgb_acc = accuracy_score(y_test_multi, xgb.predict(X_test))
-        print(f"done  (test accuracy: {xgb_acc*100:.2f}%)")
+        xgb.fit(X_train, y_train_multi, sample_weight=sample_weight)
+        xgb_preds = xgb.predict(X_test)
+        xgb_acc = accuracy_score(y_test_multi, xgb_preds)
+        xgb_f1 = f1_score(y_test_multi, xgb_preds, average="macro")
+        print(f"done  (test accuracy: {xgb_acc*100:.2f}%, macro F1: {xgb_f1:.3f})")
         joblib.dump(xgb, os.path.join(MODELS_DIR, "xgboost_model.pkl"))
     except ImportError:
         print("  ! XGBoost not installed — skipping (pip install xgboost)")
