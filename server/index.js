@@ -15,6 +15,7 @@ const nodemailer = require("nodemailer");
 const fs = require("fs");
 const path = require("path");
 const { spawn } = require("child_process");
+const crypto = require("crypto");
 const { v4: uuidv4 } = require("uuid");
 
 // ── Config ────────────────────────────────────────────────────────────────────
@@ -27,11 +28,37 @@ const ALERT_CATEGORIES = (process.env.ALERT_CRITICAL_CATEGORIES || "dos,u2r")
   .filter(Boolean);
 const ALERT_COOLDOWN_MS = Math.max(0, Number(process.env.ALERT_COOLDOWN_MS) || 5 * 60 * 1000);
 const EMAIL_ALERTS_ENABLED = String(process.env.EMAIL_ALERTS_ENABLED || "").toLowerCase() === "true";
+const API_KEY = process.env.API_KEY || "";
+const allowedOrigins = (process.env.CORS_ALLOWED_ORIGINS || "http://localhost:5173")
+  .split(",")
+  .map((origin) => origin.trim())
+  .filter(Boolean);
 
 const app = express();
-app.use(cors());
+app.use(cors({
+  origin(origin, callback) {
+    if (!origin || allowedOrigins.includes(origin)) return callback(null, true);
+    return callback(new Error("Origin not allowed by CORS"));
+  },
+}));
 app.use(express.json({ limit: "5mb" }));
 app.use(morgan("tiny"));
+
+function hasValidApiKey(req) {
+  const provided = req.get("x-api-key") || "";
+  if (!API_KEY || provided.length !== API_KEY.length) return false;
+  return crypto.timingSafeEqual(Buffer.from(provided), Buffer.from(API_KEY));
+}
+
+function requireApiKey(req, res, next) {
+  if (!API_KEY) {
+    return res.status(503).json({ error: "API_KEY is not configured" });
+  }
+  if (!hasValidApiKey(req)) {
+    return res.status(401).json({ error: "Invalid or missing API key" });
+  }
+  next();
+}
 
 // ── Alert integrations ───────────────────────────────────────────────────────
 const alertCooldowns = new Map();
@@ -264,6 +291,7 @@ function startDemo({ duration = 90, rate = 2, attacks = 0.2, clearExisting = tru
     "--rate", String(rate),
     "--attacks", String(attacks),
     "--backend", `http://localhost:${PORT}/api/analyze`,
+    "--api-key", API_KEY,
   ];
 
   const child = spawn(pythonBin, args, {
@@ -416,7 +444,7 @@ app.get("/api/alerts/status", (_req, res) => {
 });
 
 // ── POST /api/analyze — receive packet + classify ─────────────────────────────
-app.post("/api/analyze", async (req, res) => {
+app.post("/api/analyze", requireApiKey, async (req, res) => {
   try {
     const packet = req.body;
 
@@ -491,7 +519,7 @@ app.get("/api/logs", async (req, res) => {
 });
 
 // ── DELETE /api/logs ──────────────────────────────────────────────────────────
-app.delete("/api/logs", async (req, res) => {
+app.delete("/api/logs", requireApiKey, async (req, res) => {
   try {
     if (usingMongo && TrafficLog) {
       await TrafficLog.deleteMany({});
@@ -533,7 +561,7 @@ app.get("/api/demo/status", (_req, res) => {
   res.json(getDemoStatus());
 });
 
-app.post("/api/demo/start", (req, res) => {
+app.post("/api/demo/start", requireApiKey, (req, res) => {
   try {
     const duration = Math.max(15, Math.min(Number(req.body.duration) || 90, 900));
     const rate = Math.max(0.5, Math.min(Number(req.body.rate) || 2, 20));
@@ -547,7 +575,7 @@ app.post("/api/demo/start", (req, res) => {
   }
 });
 
-app.post("/api/demo/stop", (_req, res) => {
+app.post("/api/demo/stop", requireApiKey, (_req, res) => {
   const stopped = stopDemo();
   res.json({ success: stopped, status: getDemoStatus() });
 });

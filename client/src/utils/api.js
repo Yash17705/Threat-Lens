@@ -1,4 +1,10 @@
 const BASE = import.meta.env.VITE_BACKEND_URL || "http://localhost:3001";
+const API_KEY = import.meta.env.VITE_API_KEY || "";
+
+const authenticatedHeaders = {
+  "Content-Type": "application/json",
+  "X-API-Key": API_KEY,
+};
 
 async function asJson(response, message) {
   if (!response.ok) throw new Error(message);
@@ -17,7 +23,10 @@ export async function fetchLogs(limit = 100, attackOnly = false) {
 }
 
 export async function clearLogs() {
-  const r = await fetch(`${BASE}/api/logs`, { method: "DELETE" });
+  const r = await fetch(`${BASE}/api/logs`, {
+    method: "DELETE",
+    headers: authenticatedHeaders,
+  });
   return asJson(r, "clear failed");
 }
 
@@ -39,7 +48,7 @@ export async function fetchDemoStatus() {
 export async function startDemo(payload) {
   const r = await fetch(`${BASE}/api/demo/start`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: authenticatedHeaders,
     body: JSON.stringify(payload),
   });
   return asJson(r, "demo start failed");
@@ -48,7 +57,7 @@ export async function startDemo(payload) {
 export async function stopDemo() {
   const r = await fetch(`${BASE}/api/demo/stop`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: authenticatedHeaders,
   });
   return asJson(r, "demo stop failed");
 }

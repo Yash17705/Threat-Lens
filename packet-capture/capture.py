@@ -11,6 +11,7 @@ Usage:
 """
 
 import argparse
+import os
 import random
 import time
 import socket
@@ -22,6 +23,7 @@ from datetime import datetime
 from typing import Optional
 
 BACKEND_URL = "http://localhost:3001/api/analyze"
+API_KEY = os.getenv("NIDS_API_KEY", "")
 
 # ── Common port list ──────────────────────────────────────────────────────────
 COMMON_PORTS = [20, 21, 22, 23, 25, 53, 80, 110, 143, 443,
@@ -361,7 +363,8 @@ def trim_recent(history: deque, cutoff: float):
 # ── Send to backend ───────────────────────────────────────────────────────────
 def send_packet(features: dict, verbose: bool = True):
     try:
-        r = requests.post(BACKEND_URL, json=features, timeout=3)
+        headers = {"X-API-Key": API_KEY} if API_KEY else {}
+        r = requests.post(BACKEND_URL, json=features, headers=headers, timeout=3)
         if r.status_code == 200:
             res = r.json()
             result = res.get("result", {})
@@ -626,7 +629,7 @@ def live_capture(interface: Optional[str], packet_count: int):
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 def main():
-    global BACKEND_URL
+    global BACKEND_URL, API_KEY
 
     parser = argparse.ArgumentParser(description="NIDS Packet Capture")
     parser.add_argument("--simulate",  action="store_true",
@@ -643,9 +646,12 @@ def main():
                         help="Max packets for live capture (0=unlimited)")
     parser.add_argument("--backend",   type=str, default=BACKEND_URL,
                         help=f"Backend URL (default: {BACKEND_URL})")
+    parser.add_argument("--api-key", type=str, default=API_KEY,
+                        help="Backend API key (or set NIDS_API_KEY)")
     args = parser.parse_args()
 
     BACKEND_URL = args.backend
+    API_KEY = args.api_key
 
     if args.simulate:
         simulate(

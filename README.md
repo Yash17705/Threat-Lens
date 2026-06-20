@@ -90,6 +90,20 @@ nids/
 
 ## 🚀 Setup & Installation
 
+### Environment configuration
+
+Copy the example files before running locally:
+
+```bash
+cp server/.env.example server/.env
+cp client/.env.example client/.env
+```
+
+Set the same long random value for `API_KEY` in `server/.env`,
+`VITE_API_KEY` in `client/.env`, and `NIDS_API_KEY` when running packet capture.
+The backend accepts browser requests only from `CORS_ALLOWED_ORIGINS`, which can
+contain a comma-separated list of frontend URLs.
+
 ### Step 1 — ML Service (train models FIRST)
 
 ```bash
@@ -227,6 +241,76 @@ Manual download (if auto-download fails):
 | `/predict` | POST | Classify single packet |
 | `/predict/batch` | POST | Classify multiple packets |
 | `/reload-models` | POST | Reload trained models from disk |
+
+---
+
+## ☁️ Free Deployment
+
+This repository includes `render.yaml` for the Node and Python services and
+`vercel.json` for the React dashboard.
+
+### 1. MongoDB Atlas
+
+1. Create a free Atlas cluster and database user.
+2. Add `0.0.0.0/0` to the Atlas network access list because Render does not use
+   a fixed outbound IP on its free service. Use a strong database password.
+3. Copy the connection string for the `MONGODB_URI` Render variable.
+
+### 2. Render
+
+1. Push this repository to GitHub, then create a Render Blueprint from it.
+2. Render creates `nids-ml-service` and `nids-backend` from `render.yaml`.
+3. Set these backend variables when prompted:
+   - `ML_SERVICE_URL`: the complete public ML URL, such as
+     `https://nids-ml-service.onrender.com`
+   - `MONGODB_URI`: the Atlas connection string
+   - `CORS_ALLOWED_ORIGINS`: the final Vercel URL
+4. Render generates `API_KEY`. Copy its value for the next step.
+
+Free Render services sleep when idle, so the first request can be slow. The two
+services also share the workspace's free usage allowance.
+
+### 3. Vercel
+
+1. Import the same GitHub repository into Vercel.
+2. Keep the repository root as the project root; `vercel.json` builds `client`.
+3. Add `VITE_BACKEND_URL` with the complete Render backend URL.
+4. Add `VITE_API_KEY` with the same value as the backend `API_KEY`.
+5. Deploy, then update `CORS_ALLOWED_ORIGINS` on Render with the Vercel URL.
+
+`VITE_API_KEY` is included in the browser bundle, so it prevents casual or
+accidental writes but is not a true secret. For a public production application,
+replace it with user authentication and keep privileged operations server-side.
+
+### 4. Run packet capture locally
+
+Cloud services cannot capture traffic from your computer. Run the agent on the
+computer or network being monitored:
+
+```bash
+export NIDS_API_KEY="the-same-api-key"
+python packet-capture/capture.py \
+  --backend https://nids-backend.onrender.com/api/analyze
+```
+
+Live capture still requires administrator/root privileges. Simulation mode does
+not:
+
+```bash
+python packet-capture/capture.py --simulate \
+  --backend https://nids-backend.onrender.com/api/analyze
+```
+
+### Protected backend routes
+
+The following routes require an `X-API-Key` header:
+
+- `POST /api/analyze`
+- `DELETE /api/logs`
+- `POST /api/demo/start`
+- `POST /api/demo/stop`
+
+Dashboard reads and health checks remain public.
 
 **POST /predict body:**
 ```json
