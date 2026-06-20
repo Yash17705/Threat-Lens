@@ -31,13 +31,16 @@ const EMAIL_ALERTS_ENABLED = String(process.env.EMAIL_ALERTS_ENABLED || "").toLo
 const API_KEY = process.env.API_KEY || "";
 const allowedOrigins = (process.env.CORS_ALLOWED_ORIGINS || "http://localhost:5173")
   .split(",")
-  .map((origin) => origin.trim())
+  .map((origin) => origin.trim().replace(/\/$/, ""))
   .filter(Boolean);
 
 const app = express();
 app.use(cors({
   origin(origin, callback) {
-    if (!origin || allowedOrigins.includes(origin)) return callback(null, true);
+    if (!origin) return callback(null, true);
+    const cleanedOrigin = origin.trim().replace(/\/$/, "");
+    if (allowedOrigins.includes(cleanedOrigin)) return callback(null, true);
+    console.warn(`[CORS Blocked] Browser origin "${origin}" is not allowed. Configured CORS_ALLOWED_ORIGINS: [${allowedOrigins.join(", ")}]`);
     return callback(new Error("Origin not allowed by CORS"));
   },
 }));
