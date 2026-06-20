@@ -227,31 +227,168 @@ async function dispatchAlerts(log) {
   });
 }
 
-// ── Demo simulator process ───────────────────────────────────────────────────
-const ROOT_DIR = path.resolve(__dirname, "..");
+// ── Demo simulator process (Pure JS In-Memory Simulator) ─────────────────────
 const demoState = {
-  process: null,
+  running: false,
   startedAt: null,
   config: null,
   lastExitCode: null,
   lastError: null,
 };
 
-function getPythonExecutable() {
-  const candidates = [
-    path.join(ROOT_DIR, ".venv", "bin", "python"),
-    process.env.PYTHON_BIN,
-    "python3",
-    "python",
-  ].filter(Boolean);
+let demoInterval = null;
 
-  const localPython = candidates.find((candidate) => candidate.includes(path.sep) && fs.existsSync(candidate));
-  return localPython || candidates.find((candidate) => !candidate.includes(path.sep)) || "python3";
+const ATTACK_TEMPLATES_JS = {
+  neptune: {
+    attack_category: "dos",
+    prediction: "Neptune",
+    serror_rate: 0.99, srv_serror_rate: 0.99,
+    count: 511, same_srv_rate: 1.0, src_bytes: 0,
+    dst_bytes: 0, protocol_type: "tcp", logged_in: 0,
+    dst_ports: [80, 443],
+  },
+  smurf: {
+    attack_category: "dos",
+    prediction: "Smurf",
+    serror_rate: 0.0, count: 511, src_bytes: 936,
+    dst_bytes: 0, protocol_type: "icmp",
+    same_srv_rate: 1.0, diff_srv_rate: 0.0,
+    dst_ports: [0],
+  },
+  portsweep: {
+    attack_category: "probe",
+    prediction: "Portsweep",
+    diff_srv_rate: 0.81, same_srv_rate: 0.07,
+    count: 200, src_bytes: 0, dst_bytes: 0,
+    protocol_type: "tcp", serror_rate: 0.0,
+    srv_diff_host_rate: 0.78,
+    dst_ports: [21, 22, 23, 25, 53, 80, 110, 143, 443, 3389],
+  },
+  ipsweep: {
+    attack_category: "probe",
+    prediction: "IPsweep",
+    diff_srv_rate: 0.0, same_srv_rate: 1.0,
+    count: 200, src_bytes: 0, dst_bytes: 0,
+    srv_diff_host_rate: 0.95, protocol_type: "icmp",
+    dst_ports: [0],
+  },
+  guess_passwd: {
+    attack_category: "r2l",
+    prediction: "GuestPasswd",
+    num_failed_logins: 5, is_guest_login: 1,
+    logged_in: 0, count: 5, src_bytes: 200,
+    dst_bytes: 40, protocol_type: "tcp",
+    service: "ftp", same_srv_rate: 1.0, diff_srv_rate: 0.0,
+    dst_ports: [21, 22, 23],
+  },
+  buffer_overflow: {
+    attack_category: "u2r",
+    prediction: "BufferOverflow",
+    root_shell: 1, su_attempted: 1,
+    num_root: 1, src_bytes: 1408, dst_bytes: 120,
+    protocol_type: "tcp", hot: 2,
+    num_compromised: 1, num_shells: 1,
+    service: "telnet", dst_ports: [22, 23],
+  },
+};
+
+function randPrivateIp() {
+  const prefixes = ["192.168.1.", "10.0.0.", "172.16.0."];
+  const prefix = prefixes[Math.floor(Math.random() * prefixes.length)];
+  return prefix + Math.floor(Math.random() * 254 + 1);
+}
+
+function generateNormalPacket() {
+  const protocol = Math.random() < 0.7 ? "tcp" : (Math.random() < 0.7 ? "udp" : "icmp");
+  const services = {
+    tcp: ["http", "http_443", "ssh", "ftp", "smtp"],
+    udp: ["domain_u", "ntp_u", "other"],
+    icmp: ["eco_i", "ecr_i"]
+  };
+  const service = services[protocol][Math.floor(Math.random() * services[protocol].length)];
+  const flags = {
+    tcp: ["SF", "SF", "S0", "REJ"],
+    udp: ["SF"],
+    icmp: ["SF"]
+  };
+  const flag = flags[protocol][Math.floor(Math.random() * flags[protocol].length)];
+
+  return {
+    duration: Math.floor(Math.random() * 3),
+    protocol_type: protocol,
+    service: service,
+    flag: flag,
+    src_bytes: Math.floor(Math.random() * 1000 + 40),
+    dst_bytes: Math.floor(Math.random() * 5000 + 40),
+    land: 0,
+    wrong_fragment: 0,
+    urgent: 0,
+    hot: 0,
+    num_failed_logins: 0,
+    logged_in: protocol === "tcp" && Math.random() < 0.8 ? 1 : 0,
+    num_compromised: 0,
+    root_shell: 0,
+    su_attempted: 0,
+    num_root: 0,
+    num_file_creations: 0,
+    num_shells: 0,
+    num_access_files: 0,
+    num_outbound_cmds: 0,
+    is_host_login: 0,
+    is_guest_login: 0,
+    count: Math.floor(Math.random() * 10 + 1),
+    srv_count: Math.floor(Math.random() * 10 + 1),
+    serror_rate: 0.0,
+    srv_serror_rate: 0.0,
+    rerror_rate: 0.0,
+    srv_rerror_rate: 0.0,
+    same_srv_rate: 1.0,
+    diff_srv_rate: 0.0,
+    srv_diff_host_rate: 0.0,
+    dst_host_count: Math.floor(Math.random() * 50 + 10),
+    dst_host_srv_count: Math.floor(Math.random() * 50 + 10),
+    dst_host_same_srv_rate: 1.0,
+    dst_host_diff_srv_rate: 0.0,
+    dst_host_same_src_port_rate: 0.05,
+    dst_host_srv_diff_host_rate: 0.0,
+    dst_host_serror_rate: 0.0,
+    dst_host_srv_serror_rate: 0.0,
+    dst_host_rerror_rate: 0.0,
+    dst_host_srv_rerror_rate: 0.0,
+    
+    // network metadata
+    src_ip: randPrivateIp(),
+    dst_ip: randPrivateIp(),
+    src_port: protocol === "icmp" ? 0 : Math.floor(Math.random() * 64511 + 1024),
+    dst_port: protocol === "icmp" ? 0 : (service === "http" ? 80 : (service === "http_443" ? 443 : (service === "ssh" ? 22 : 80))),
+    packet_length: Math.floor(Math.random() * 1000 + 60),
+    protocol: protocol.toUpperCase(),
+  };
+}
+
+function generateAttackPacket(templateName) {
+  const template = ATTACK_TEMPLATES_JS[templateName];
+  const base = generateNormalPacket();
+  
+  const packet = {
+    ...base,
+    ...template,
+    protocol_type: template.protocol_type,
+    protocol: template.protocol_type.toUpperCase(),
+    src_ip: randPrivateIp(),
+    dst_ip: randPrivateIp(),
+  };
+  
+  packet.src_port = packet.protocol === "ICMP" ? 0 : Math.floor(Math.random() * 64511 + 1024);
+  packet.dst_port = packet.protocol === "ICMP" ? 0 : template.dst_ports[Math.floor(Math.random() * template.dst_ports.length)];
+  delete packet.dst_ports;
+  
+  return packet;
 }
 
 function getDemoStatus() {
   return {
-    running: !!demoState.process,
+    running: demoState.running,
     started_at: demoState.startedAt,
     config: demoState.config,
     last_exit_code: demoState.lastExitCode,
@@ -260,13 +397,17 @@ function getDemoStatus() {
 }
 
 function stopDemo() {
-  if (!demoState.process) return false;
-  demoState.process.kill("SIGTERM");
+  if (!demoInterval) return false;
+  clearInterval(demoInterval);
+  demoInterval = null;
+  demoState.running = false;
+  demoState.startedAt = null;
+  demoState.lastExitCode = 0;
   return true;
 }
 
 function startDemo({ duration = 90, rate = 2, attacks = 0.2, clearExisting = true } = {}) {
-  if (demoState.process) {
+  if (demoInterval) {
     const err = new Error("Demo is already running");
     err.status = 409;
     throw err;
@@ -279,45 +420,77 @@ function startDemo({ duration = 90, rate = 2, attacks = 0.2, clearExisting = tru
       byCategory: { dos:0, probe:0, r2l:0, u2r:0, anomaly:0 },
       history: [],
     });
+    if (usingMongo && TrafficLog) {
+      TrafficLog.deleteMany({}).catch(() => {});
+    }
   }
 
-  if (usingMongo && TrafficLog) {
-    TrafficLog.deleteMany({}).catch(() => {});
-  }
-
-  const pythonBin = getPythonExecutable();
-  const scriptPath = path.join(ROOT_DIR, "packet-capture", "capture.py");
-  const args = [
-    scriptPath,
-    "--simulate",
-    "--duration", String(duration),
-    "--rate", String(rate),
-    "--attacks", String(attacks),
-    "--backend", `http://localhost:${PORT}/api/analyze`,
-    "--api-key", API_KEY,
-  ];
-
-  const child = spawn(pythonBin, args, {
-    cwd: path.join(ROOT_DIR, "packet-capture"),
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-
-  demoState.process = child;
   demoState.startedAt = new Date().toISOString();
   demoState.config = { duration, rate, attacks, clearExisting };
   demoState.lastExitCode = null;
   demoState.lastError = null;
+  demoState.running = true;
 
-  child.stdout.on("data", (chunk) => process.stdout.write(`[demo] ${chunk}`));
-  child.stderr.on("data", (chunk) => process.stderr.write(`[demo] ${chunk}`));
-  child.on("error", (err) => {
-    demoState.lastError = err.message;
-  });
-  child.on("close", (code) => {
-    demoState.lastExitCode = code;
-    demoState.process = null;
-    demoState.startedAt = null;
-  });
+  const intervalMs = 1000 / rate;
+  const endTime = Date.now() + duration * 1000;
+  
+  const attackTemplates = Object.keys(ATTACK_TEMPLATES_JS);
+  let attackCount = 0;
+
+  demoInterval = setInterval(async () => {
+    if (Date.now() >= endTime) {
+      stopDemo();
+      return;
+    }
+
+    try {
+      let packet;
+      if (Math.random() < attacks) {
+        const tmpl = attackTemplates[attackCount % attackTemplates.length];
+        packet = generateAttackPacket(tmpl);
+        attackCount++;
+      } else {
+        packet = generateNormalPacket();
+      }
+
+      // Call ML classification
+      const result = await callML(packet);
+
+      // Update stats
+      stats.total++;
+      if (result.is_attack) {
+        stats.attacks++;
+        const cat = result.attack_category;
+        if (cat in stats.byCategory) stats.byCategory[cat]++;
+      } else {
+        stats.normal++;
+      }
+
+      const log = {
+        id:              uuidv4(),
+        timestamp:       new Date(),
+        src_ip:          packet.src_ip,
+        dst_ip:          packet.dst_ip,
+        src_port:        packet.src_port,
+        dst_port:        packet.dst_port,
+        protocol:        packet.protocol,
+        packet_length:   packet.packet_length,
+        prediction:      result.prediction,
+        is_attack:       result.is_attack,
+        confidence:      result.confidence,
+        attack_category: result.attack_category,
+        model_used:      result.model_used,
+        features:        packet,
+      };
+
+      await storeLog(log);
+      dispatchAlerts(log).catch((err) => {
+        console.error("alert dispatch error:", err.message);
+      });
+    } catch (err) {
+      console.error("Demo packet generation/processing error:", err.message);
+    }
+  }, intervalMs);
 }
 
 // ── MongoDB ───────────────────────────────────────────────────────────────────
