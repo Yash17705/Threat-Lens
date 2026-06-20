@@ -45,6 +45,17 @@ const SEVERITY_MAP = {
 };
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+function escapeHtml(str) {
+  if (str === undefined || str === null) return "";
+  return String(str)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#x27;")
+    .replace(/\//g, "&#x2F;");
+}
+
 function fmt(n) {
   if (n === undefined || n === null) return "—";
   return Number(n).toLocaleString();
@@ -85,20 +96,20 @@ function openPrintableReport({ stats, logs, history, demoStatus }) {
 
   const rows = logs.map((log) => `
     <tr>
-      <td>${new Date(log.timestamp || Date.now()).toLocaleString()}</td>
-      <td>${log.src_ip || "—"}</td>
-      <td>${log.dst_ip || "—"}</td>
-      <td>${log.protocol || "—"}</td>
-      <td>${log.prediction || "—"}</td>
-      <td>${(log.attack_category || "normal").toUpperCase()}</td>
+      <td>${escapeHtml(new Date(log.timestamp || Date.now()).toLocaleString())}</td>
+      <td>${escapeHtml(log.src_ip || "—")}</td>
+      <td>${escapeHtml(log.dst_ip || "—")}</td>
+      <td>${escapeHtml(log.protocol || "—")}</td>
+      <td>${escapeHtml(log.prediction || "—")}</td>
+      <td>${escapeHtml((log.attack_category || "normal").toUpperCase())}</td>
       <td>${log.confidence != null ? Number(log.confidence).toFixed(1) : "—"}</td>
-      <td>${log.model_used || "—"}</td>
+      <td>${escapeHtml(log.model_used || "—")}</td>
     </tr>
   `).join("");
 
   const historyRows = history.slice(-10).map((point) => `
     <tr>
-      <td>${new Date(point.time).toLocaleTimeString()}</td>
+      <td>${escapeHtml(new Date(point.time).toLocaleTimeString())}</td>
       <td>${point.total_cumulative || 0}</td>
       <td>${point.attacks_cumulative || 0}</td>
     </tr>
@@ -134,8 +145,8 @@ function openPrintableReport({ stats, logs, history, demoStatus }) {
           <button class="button secondary" onclick="window.close()">Close</button>
         </div>
         <h1>Network Intrusion Detection System Report</h1>
-        <div class="meta">Generated: ${new Date().toLocaleString()}</div>
-        <div class="meta">Storage: ${(stats?.storage || "unknown").toUpperCase()} | Demo mode: ${demoStatus?.running ? "RUNNING" : "IDLE"}</div>
+        <div class="meta">Generated: ${escapeHtml(new Date().toLocaleString())}</div>
+        <div class="meta">Storage: ${escapeHtml((stats?.storage || "unknown").toUpperCase())} | Demo mode: ${escapeHtml(demoStatus?.running ? "RUNNING" : "IDLE")}</div>
         <div class="grid">
           <div class="card"><div class="label">Total Packets</div><div class="value">${stats?.total_packets || 0}</div></div>
           <div class="card"><div class="label">Attack Packets</div><div class="value">${stats?.attack_packets || 0}</div></div>
