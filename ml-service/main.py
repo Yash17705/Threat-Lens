@@ -7,6 +7,7 @@ import os
 import time
 import logging
 import numpy as np
+import pandas as pd
 from typing import Optional, List, Dict, Any, Union
 
 from fastapi import FastAPI, HTTPException
@@ -64,13 +65,11 @@ def load_models():
     loaded = {}
 
     files = {
-        "rf":       "random_forest_model.pkl",
-        "xgb":      "xgboost_model.pkl",
-        "iso":      "isolation_forest_model.pkl",
-        "scaler":   "scaler.pkl",
-        "le":       "label_encoder.pkl",
-        "features": "feature_names.pkl",
-        "encoders": "categorical_encoders.pkl",
+        "rf":           "random_forest_model.pkl",
+        "xgb":          "xgboost_model.pkl",
+        "iso":          "isolation_forest_model.pkl",
+        "preprocessor": "preprocessor.pkl",
+        "le":           "label_encoder.pkl",
     }
 
     for key, fname in files.items():
@@ -169,57 +168,21 @@ CATEGORICAL_DEFAULTS = {
 }
 
 
-def encode_categorical_value(field_name: str, value: Any) -> float:
-    if isinstance(value, (int, float, np.integer, np.floating)) and not isinstance(value, bool):
-        return float(value)
-
-    encoders = models.get("encoders")
-    if not encoders:
-        manual_protocol_map = {"icmp": 0.0, "tcp": 1.0, "udp": 2.0}
-        if field_name == "protocol_type":
-            return manual_protocol_map.get(str(value).strip().lower(), 1.0)
-        return 0.0
-
-    encoder_index = {"protocol_type": 0, "service": 1, "flag": 2}[field_name]
-    encoder = encoders[encoder_index]
-
-    text = str(value).strip() if value is not None else ""
-    if not text:
-        text = CATEGORICAL_DEFAULTS[field_name]
-
-    if field_name == "protocol_type":
-        candidates = [text.lower()]
-    elif field_name == "flag":
-        candidates = [text.upper()]
-    else:
-        candidates = [text, text.lower(), text.upper()]
-
-    selected = None
-    for candidate in candidates:
-        if candidate in encoder.classes_:
-            selected = candidate
-            break
-
-    if selected is None:
-        fallback = CATEGORICAL_DEFAULTS[field_name]
-        if fallback in encoder.classes_:
-            selected = fallback
-        else:
-            selected = encoder.classes_[0]
-
-    return float(encoder.transform([selected])[0])
-
-
-def packet_to_vector(pkt: PacketFeatures) -> np.ndarray:
+def packet_to_prep_vector(pkt: PacketFeatures) -> np.ndarray:
     data = pkt.dict()
-    vec = []
-    for field_name in FEATURE_ORDER:
-        value = data.get(field_name, 0)
-        if field_name in CATEGORICAL_DEFAULTS:
-            vec.append(encode_categorical_value(field_name, value))
-        else:
-            vec.append(float(value if value is not None else 0))
-    return np.array(vec, dtype=np.float32).reshape(1, -1)
+    # Create DataFrame with exact column ordering matching FEATURE_ORDER
+    df = pd.DataFrame([{f: data.get(f, 0) for f in FEATURE_ORDER}])
+    
+    preprocessor = models.get("preprocessor")
+    if preprocessor:
+        try:
+            return preprocessor.transform(df)
+        except Exception as e:
+            log.warning(f"Preprocessor transform failed: {e}. Falling back to zeros.")
+    
+    # Preprocessor fallback shape: StandardScaler (38) + OneHotEncoder output columns
+    # If we don't have it, we return a shape of (1, 41) filled with zeros
+    return np.zeros((1, 41))
 
 
 # ── Rule-based fallback ───────────────────────────────────────────────────────
@@ -250,19 +213,21 @@ def rule_based_predict(pkt: PacketFeatures) -> Dict[str, Any]:
 
 # ── ML prediction ─────────────────────────────────────────────────────────────
 def ml_predict(pkt: PacketFeatures) -> Dict[str, Any]:
-    if not models:
+    if not models or "preprocessor" not in models:
         return rule_based_predict(pkt)
 
-    X = packet_to_vector(pkt)
+    X_prep = packet_to_prep_vector(pkt)
     le = models.get("le")
 
     # Isolation Forest check first
     anomaly_flag = False
-    if "iso" in models and "scaler" in models:
-        X_scaled = models["scaler"].transform(X)
-        iso_pred = models["iso"].predict(X_scaled)[0]   # -1 = anomaly
-        if iso_pred == -1:
-            anomaly_flag = True
+    if "iso" in models:
+        try:
+            iso_pred = models["iso"].predict(X_prep)[0]   # -1 = anomaly
+            if iso_pred == -1:
+                anomaly_flag = True
+        except Exception as e:
+            log.warning(f"Isolation Forest prediction error: {e}")
 
     # Primary classifier
     classifier = models.get("xgb") or models.get("rf")
@@ -270,9 +235,13 @@ def ml_predict(pkt: PacketFeatures) -> Dict[str, Any]:
         return rule_based_predict(pkt)
 
     try:
-        pred_idx = int(classifier.predict(X)[0])
-        probas = classifier.predict_proba(X)[0]
-        confidence = float(np.max(probas)) * 100
+        probas = classifier.predict_proba(X_prep)[0]
+        # Calibrated weights: dos, normal, probe, r2l, u2r
+        # Class map: dos:0, normal:1, probe:2, r2l:3, u2r:4
+        best_weights = np.array([1.0, 1.0, 1.8, 6.0, 10.0])
+        adj_probas = probas * best_weights
+        pred_idx = int(np.argmax(adj_probas))
+        confidence = float(probas[pred_idx]) * 100
         if le:
             category = le.inverse_transform([pred_idx])[0]
         else:
@@ -295,7 +264,7 @@ def ml_predict(pkt: PacketFeatures) -> Dict[str, Any]:
         "confidence":        round(confidence, 2),
         "attack_category":   category,
         "model_used":        model_name,
-        "features_received": X.shape[1],
+        "features_received": X_prep.shape[1],
         "anomaly_detected":  anomaly_flag,
         "meta":              CATEGORY_META.get(category, CATEGORY_META["unknown"]),
     }

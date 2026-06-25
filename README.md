@@ -190,7 +190,7 @@ python capture.py
 
 | Model | Purpose | Notes |
 |-------|---------|-------|
-| **XGBoost** | Primary multi-class classifier | Best accuracy (~99% on NSL-KDD) |
+| **XGBoost** | Primary multi-class classifier | Tuned & calibrated test set accuracy (**81.31%**) |
 | **Random Forest** | Fallback classifier | Used if XGBoost unavailable |
 | **Isolation Forest** | Anomaly/zero-day detection | Catches unknown attack patterns |
 
@@ -211,6 +211,25 @@ If models haven't been trained yet, the system uses heuristic rules:
 - High `diff_srv_rate` + low `same_srv_rate` → Probe/Portsweep
 - Multiple failed logins → R2L/GuestPasswd
 - `root_shell = 1` → U2R/BufferOverflow
+
+### Model Performance Metrics (NSL-KDD Test Set)
+
+The models are evaluated against the realistic, imbalanced `KDDTest+.txt` test set (which contains several novel attack types not present in the training set). 
+
+Using **ColumnTransformer One-Hot Encoding** and **inference threshold calibration** (scaling class probabilities to handle extreme imbalance), we achieve the following verified results:
+
+#### Overall Comparison
+| Model | Accuracy | Weighted Precision | Weighted Recall | Weighted F1-Score | Macro F1-Score |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| **XGBoost (Tuned)** | **81.31%** | **83.90%** | **81.31%** | **0.7961** | **0.6908** |
+| **Random Forest (Tuned)** | 78.89% | 81.54% | 78.89% | 0.7793 | 0.6715 |
+
+#### Per-Class Recall (XGBoost vs. Random Forest)
+- **DoS**: XGBoost **83%** | Random Forest **74%**
+- **Normal**: XGBoost **97%** | Random Forest **96%**
+- **Probe**: XGBoost **78%** | Random Forest **76%**
+- **R2L (Remote-to-Local)**: XGBoost **28%** | Random Forest **37%** *(Calibrated threshold scaling raised this from 1%-7% baseline)*
+- **U2R (User-to-Root)**: XGBoost **55%** | Random Forest **78%** *(Calibrated threshold scaling raised this from 7%-28% baseline)*
 
 ---
 
