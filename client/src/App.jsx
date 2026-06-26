@@ -118,7 +118,7 @@ function openPrintableReport({ stats, logs, history, demoStatus }) {
   const html = `
     <html>
       <head>
-        <title>NIDS Report</title>
+        <title>Threat Lens Report</title>
         <style>
           body { font-family: Arial, sans-serif; padding: 24px; color: #111827; }
           h1, h2 { margin: 0 0 12px; }
@@ -144,7 +144,7 @@ function openPrintableReport({ stats, logs, history, demoStatus }) {
           <button class="button" onclick="window.print()">Save as PDF</button>
           <button class="button secondary" onclick="window.close()">Close</button>
         </div>
-        <h1>Network Intrusion Detection System Report</h1>
+        <h1>Threat Lens Security Analysis Report</h1>
         <div class="meta">Generated: ${escapeHtml(new Date().toLocaleString())}</div>
         <div class="meta">Storage: ${escapeHtml((stats?.storage || "unknown").toUpperCase())} | Demo mode: ${escapeHtml(demoStatus?.running ? "RUNNING" : "IDLE")}</div>
         <div class="grid">
@@ -527,7 +527,7 @@ function DemoPanel({ demoStatus, busy, onStart, onStop }) {
             DEMO MODE
           </div>
           <div style={{ marginTop: 8, color: "var(--text-2)", fontSize: 14 }}>
-            Start a guided simulator run from the dashboard for mentor demos and report screenshots.
+            Simulate live network traffic to evaluate model accuracy, latency, and threat detection alerts.
           </div>
           <div style={{ marginTop: 8, color: demoStatus?.running ? "var(--green)" : "var(--text-3)", fontFamily: "var(--mono)", fontSize: 12 }}>
             {demoStatus?.running
@@ -708,12 +708,13 @@ export default function App() {
 
           <div>
             <div style={{
-              fontFamily: "var(--mono)", fontSize: 15,
-              color: "var(--accent)", letterSpacing: 3,
+              fontFamily: "var(--sans)", fontSize: 20, fontWeight: 700,
+              color: "var(--accent)", letterSpacing: 2, textTransform: "uppercase",
+              lineHeight: 1.1
             }}>
-              N · I · D · S
+              Threat Lens
             </div>
-            <div style={{ fontSize: 10, color: "var(--text-3)", letterSpacing: 2 }}>
+            <div style={{ fontSize: 10, color: "var(--text-3)", letterSpacing: 1.5 }}>
               NETWORK INTRUSION DETECTION SYSTEM
             </div>
           </div>
@@ -900,7 +901,7 @@ export default function App() {
               padding: "40px 0", textAlign: "center",
               fontFamily: "var(--mono)", color: "var(--red)", fontSize: 12,
             }}>
-              ✗ CANNOT REACH BACKEND — run <span style={{ color: "var(--accent)" }}>npm start</span> in server/
+              ⚠️ CONNECTION OFFLINE — UNABLE TO REACH DETECTION SERVICE
             </div>
           ) : (
             <LogTable logs={logs} />
@@ -914,7 +915,7 @@ export default function App() {
           fontFamily: "var(--mono)", fontSize: 10,
           color: "var(--text-3)",
         }}>
-          <span>NIDS v1.0 · XGBoost + Isolation Forest · NSL-KDD</span>
+          <span>Threat Lens v1.0 · XGBoost + Isolation Forest · NSL-KDD</span>
           <span>POLL INTERVAL: {POLL_INTERVAL / 1000}s · EDUCATIONAL USE ONLY</span>
         </div>
       </div>

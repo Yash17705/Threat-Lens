@@ -6,6 +6,17 @@ real-time results on a dark-themed React dashboard.
 
 ---
 
+## 🌐 Live Demo
+
+Experience the React Dashboard interface in action:
+👉 **[Threat Lens Live Demo](https://threat-lens-lovat.vercel.app/)**
+
+> [!NOTE]
+> * **Backend Wake-Up Time**: Please wait 1 to 2 minutes when first loading the demo. The backend services are hosted on a free Render tier and may take a moment to spin up if they have gone idle.
+> * **Local Installation vs. Web Demo**: The live web demo allows you to inspect the dashboard interface and traffic history. To experience the full capabilities of the system—such as capturing live network packets from your own machine and running simulated traffic scripts—please install and run the application locally on your PC by following the [Setup & Installation](#-setup--installation) instructions below.
+
+---
+
 ## 📐 Architecture
 
 ```
