@@ -9,7 +9,7 @@ services:
     healthCheckPath: /health
     envVars:
       - key: PYTHON_VERSION
-        value: 3.10.12
+        value: 3.13.9
 
   - type: web
     name: nids-backend
