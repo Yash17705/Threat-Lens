@@ -23,7 +23,6 @@ try:
 except ImportError:
     HAS_IMBLEARN = False
     print("⚠️  imbalanced-learn not installed. Install with: pip install imbalanced-learn")
-
 try:
     from xgboost import XGBClassifier
     HAS_XGBOOST = True

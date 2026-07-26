@@ -1,63 +1,107 @@
-const BASE = import.meta.env.VITE_BACKEND_URL || "http://localhost:3001";
-const API_KEY = import.meta.env.VITE_API_KEY || "";
+/**
+ * api.js — NIDS frontend API helpers
+ *
+ * Wraps all backend requests with:
+ *  - Consistent base URL / API key config
+ *  - Typed error handling (network vs. HTTP errors)
+ *  - Exponential backoff retry for transient failures
+ */
+
+const BASE    = import.meta.env.VITE_BACKEND_URL || "http://localhost:3001";
+const API_KEY = import.meta.env.VITE_API_KEY     || "";
 
 const authenticatedHeaders = {
   "Content-Type": "application/json",
   "X-API-Key": API_KEY,
 };
 
-async function asJson(response, message) {
-  if (!response.ok) throw new Error(message);
-  return response.json();
+// ── Error types ────────────────────────────────────────────────────────────────
+class ApiError extends Error {
+  constructor(message, status) {
+    super(message);
+    this.name   = "ApiError";
+    this.status = status;
+  }
 }
 
+// ── Core fetch helper with retry ───────────────────────────────────────────────
+async function apiFetch(url, options = {}, { retries = 2, retryDelay = 500 } = {}) {
+  let lastErr;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const res = await fetch(url, options);
+      if (!res.ok) {
+        let detail = "";
+        try {
+          const body = await res.clone().json();
+          detail = body?.error || body?.message || "";
+        } catch { /* ignore */ }
+        throw new ApiError(
+          `HTTP ${res.status}: ${detail || res.statusText}`,
+          res.status,
+        );
+      }
+      return res.json();
+    } catch (err) {
+      lastErr = err;
+      // Don't retry on auth/validation errors
+      if (err instanceof ApiError && err.status >= 400 && err.status < 500) throw err;
+      if (attempt < retries) {
+        await new Promise(resolve => setTimeout(resolve, retryDelay * Math.pow(2, attempt)));
+      }
+    }
+  }
+  throw lastErr;
+}
+
+// ── Public API ────────────────────────────────────────────────────────────────
 export async function fetchStats() {
-  const r = await fetch(`${BASE}/api/stats`);
-  return asJson(r, "stats fetch failed");
+  return apiFetch(`${BASE}/api/stats`);
 }
 
 export async function fetchLogs(limit = 100, attackOnly = false) {
-  const url = `${BASE}/api/logs?limit=${limit}&attack_only=${attackOnly}`;
-  const r = await fetch(url);
-  return asJson(r, "logs fetch failed");
+  return apiFetch(`${BASE}/api/logs?limit=${limit}&attack_only=${attackOnly}`);
 }
 
 export async function clearLogs() {
-  const r = await fetch(`${BASE}/api/logs`, {
+  return apiFetch(`${BASE}/api/logs`, {
     method: "DELETE",
     headers: authenticatedHeaders,
   });
-  return asJson(r, "clear failed");
 }
 
 export async function checkHealth() {
-  const r = await fetch(`${BASE}/health`);
-  return r.ok;
+  try {
+    const data = await apiFetch(`${BASE}/health`, {}, { retries: 1, retryDelay: 300 });
+    return !!(data?.status === "ok" || data?.status);
+  } catch {
+    return false;
+  }
 }
 
 export async function fetchHistory() {
-  const r = await fetch(`${BASE}/api/stats/history`);
-  return asJson(r, "history fetch failed");
+  return apiFetch(`${BASE}/api/stats/history`);
 }
 
 export async function fetchDemoStatus() {
-  const r = await fetch(`${BASE}/api/demo/status`);
-  return asJson(r, "demo status fetch failed");
+  return apiFetch(`${BASE}/api/demo/status`);
 }
 
 export async function startDemo(payload) {
-  const r = await fetch(`${BASE}/api/demo/start`, {
+  return apiFetch(`${BASE}/api/demo/start`, {
     method: "POST",
     headers: authenticatedHeaders,
     body: JSON.stringify(payload),
   });
-  return asJson(r, "demo start failed");
 }
 
 export async function stopDemo() {
-  const r = await fetch(`${BASE}/api/demo/stop`, {
+  return apiFetch(`${BASE}/api/demo/stop`, {
     method: "POST",
     headers: authenticatedHeaders,
   });
-  return asJson(r, "demo stop failed");
+}
+
+export async function fetchAlertStatus() {
+  return apiFetch(`${BASE}/api/alerts/status`);
 }

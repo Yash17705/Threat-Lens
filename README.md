@@ -536,7 +536,6 @@ Live packet capture requires elevated privileges:
 - `react` + `react-dom` — UI framework
 - `chart.js` + `react-chartjs-2` — Data visualization
 - `vite` — Build tool
-wert
 
 ## License
 

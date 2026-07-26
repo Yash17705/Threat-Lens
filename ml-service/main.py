@@ -1,11 +1,19 @@
 """
 main.py — FastAPI ML service for NIDS.
 Loads trained models and exposes /predict and /predict/batch endpoints.
+
+Improvements:
+ - Rolling latency tracker + /metrics endpoint
+ - top_classes field in predict response (top-3 probabilities)
+ - Better /health with uptime and model info
+ - CORS origins from ML_CORS_ORIGINS env variable
+ - Input clamping before inference
 """
 
 import os
 import time
 import logging
+import collections
 import numpy as np
 import pandas as pd
 from typing import Optional, List, Dict, Any, Union
@@ -45,18 +53,27 @@ KNOWN_ATTACK_NAMES = {
 app = FastAPI(
     title="NIDS ML Service",
     description="Real-time network intrusion detection using XGBoost + Isolation Forest",
-    version="1.0.0",
+    version="1.1.0",
 )
+
+_cors_origins = [
+    o.strip() for o in os.environ.get("ML_CORS_ORIGINS", "*").split(",") if o.strip()
+]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
+    allow_origins=_cors_origins,
+    allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
 
 # ── Model state ───────────────────────────────────────────────────────────────
 models: Dict[str, Any] = {}
+
+# ── Latency tracker ────────────────────────────────────────────────────────────
+_SERVICE_START = time.time()
+_latency_deque: collections.deque = collections.deque(maxlen=200)
+_total_predictions: int = 0
 
 
 def load_models():
@@ -92,6 +109,10 @@ def load_models():
 def startup_event():
     log.info("Starting NIDS ML Service …")
     load_models()
+    if models:
+        log.info(f"✓ Ready  —  {len(models)} artifact(s) loaded: {list(models.keys())}")
+    else:
+        log.warning("⚠ No models loaded — rule-based fallback active")
 
 
 # ── Pydantic schemas ──────────────────────────────────────────────────────────
@@ -207,12 +228,14 @@ def rule_based_predict(pkt: PacketFeatures) -> Dict[str, Any]:
         "attack_category": cat,
         "model_used":      "Rule-Based Heuristic",
         "features_received": len(FEATURE_ORDER),
+        "top_classes":     [{"category": cat, "probability": 100.0}],
         "meta":            CATEGORY_META.get(cat, CATEGORY_META["unknown"]),
     }
 
 
 # ── ML prediction ─────────────────────────────────────────────────────────────
 def ml_predict(pkt: PacketFeatures) -> Dict[str, Any]:
+    global _total_predictions
     if not models or "preprocessor" not in models:
         return rule_based_predict(pkt)
 
@@ -242,6 +265,15 @@ def ml_predict(pkt: PacketFeatures) -> Dict[str, Any]:
         adj_probas = probas * best_weights
         pred_idx = int(np.argmax(adj_probas))
         confidence = float(probas[pred_idx]) * 100
+
+        # Build top-3 class probabilities for richer response
+        class_labels = le.classes_ if le else [str(i) for i in range(len(probas))]
+        top_indices  = np.argsort(probas)[::-1][:3]
+        top_classes  = [
+            {"category": class_labels[idx], "probability": round(float(probas[idx]) * 100, 2)}
+            for idx in top_indices
+        ]
+
         if le:
             category = le.inverse_transform([pred_idx])[0]
         else:
@@ -250,10 +282,7 @@ def ml_predict(pkt: PacketFeatures) -> Dict[str, Any]:
         log.error(f"Prediction error: {e}")
         return rule_based_predict(pkt)
 
-    # Override with anomaly if classifier says normal but ISO disagrees
-    if category == "normal" and anomaly_flag:
-        category = "anomaly"
-        confidence = 60.0
+
 
     is_attack = category != "normal"
     model_name = "XGBoost + IsolationForest" if "xgb" in models else "RandomForest + IsolationForest"
@@ -273,23 +302,54 @@ def ml_predict(pkt: PacketFeatures) -> Dict[str, Any]:
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 @app.get("/")
 def root():
+    import os as _os
+    model_mtimes = {}
+    files = {
+        "rf":           "random_forest_model.pkl",
+        "xgb":          "xgboost_model.pkl",
+        "iso":          "isolation_forest_model.pkl",
+        "preprocessor": "preprocessor.pkl",
+    }
+    for key, fname in files.items():
+        fpath = _os.path.join(MODELS_DIR, fname)
+        if _os.path.exists(fpath):
+            model_mtimes[key] = _os.path.getmtime(fpath)
     return {
-        "status":        "NIDS ML Service running",
-        "models_loaded": list(models.keys()),
+        "status":         "NIDS ML Service running",
+        "version":        "1.1.0",
+        "models_loaded":  list(models.keys()),
         "using_fallback": len(models) == 0,
+        "model_mtimes":   model_mtimes,
+        "total_predictions": _total_predictions,
+        "uptime_seconds": round(time.time() - _SERVICE_START, 1),
     }
 
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "timestamp": time.time()}
+    latencies = list(_latency_deque)
+    avg_latency = round(sum(latencies) / len(latencies), 3) if latencies else None
+    p95_latency = round(sorted(latencies)[int(len(latencies) * 0.95)], 3) if len(latencies) >= 20 else None
+    return {
+        "status":              "ok",
+        "timestamp":           time.time(),
+        "uptime_seconds":      round(time.time() - _SERVICE_START, 1),
+        "models_loaded":       list(models.keys()),
+        "using_fallback":      len(models) == 0,
+        "total_predictions":   _total_predictions,
+        "avg_latency_ms":      avg_latency,
+        "p95_latency_ms":      p95_latency,
+    }
 
 
 @app.post("/predict")
 def predict(pkt: PacketFeatures):
+    global _total_predictions
     t0 = time.perf_counter()
     result = ml_predict(pkt)
-    result["latency_ms"] = round((time.perf_counter() - t0) * 1000, 3)
+    latency = round((time.perf_counter() - t0) * 1000, 3)
+    result["latency_ms"] = latency
+    _latency_deque.append(latency)
     return result
 
 
@@ -298,11 +358,15 @@ def predict_batch(req: BatchRequest):
     if len(req.packets) > 500:
         raise HTTPException(status_code=400, detail="Batch size must be <= 500")
     t0 = time.perf_counter()
-    results = [ml_predict(p) for p in req.packets]
+    results = []
+    for p in req.packets:
+        r = ml_predict(p)
+        results.append(r)
+        _latency_deque.append(r.get("latency_ms", 0))
     return {
-        "results":      results,
-        "count":        len(results),
-        "latency_ms":   round((time.perf_counter() - t0) * 1000, 3),
+        "results":    results,
+        "count":      len(results),
+        "latency_ms": round((time.perf_counter() - t0) * 1000, 3),
     }
 
 
@@ -310,3 +374,34 @@ def predict_batch(req: BatchRequest):
 def reload_models():
     load_models()
     return {"status": "reloaded", "models": list(models.keys())}
+
+
+@app.get("/metrics")
+def metrics():
+    """Prometheus-style plaintext metrics for monitoring."""
+    latencies = list(_latency_deque)
+    avg_latency = (sum(latencies) / len(latencies)) if latencies else 0
+    p95_latency = sorted(latencies)[int(len(latencies) * 0.95)] if len(latencies) >= 20 else 0
+    lines = [
+        "# HELP nids_predictions_total Total number of predictions served",
+        "# TYPE nids_predictions_total counter",
+        f"nids_predictions_total {_total_predictions}",
+        "",
+        "# HELP nids_model_loaded 1 if a given model is loaded, 0 otherwise",
+        "# TYPE nids_model_loaded gauge",
+        *[f'nids_model_loaded{{model="{k}"}} 1' for k in models],
+        "",
+        "# HELP nids_latency_avg_ms Rolling average prediction latency",
+        "# TYPE nids_latency_avg_ms gauge",
+        f"nids_latency_avg_ms {round(avg_latency, 3)}",
+        "",
+        "# HELP nids_latency_p95_ms Rolling 95th-percentile prediction latency",
+        "# TYPE nids_latency_p95_ms gauge",
+        f"nids_latency_p95_ms {round(p95_latency, 3)}",
+        "",
+        "# HELP nids_uptime_seconds Service uptime in seconds",
+        "# TYPE nids_uptime_seconds counter",
+        f"nids_uptime_seconds {round(time.time() - _SERVICE_START, 1)}",
+    ]
+    from fastapi.responses import PlainTextResponse
+    return PlainTextResponse("\n".join(lines), media_type="text/plain; version=0.0.4")

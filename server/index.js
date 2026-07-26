@@ -3,20 +3,34 @@
  *
  * Receives packet feature data, forwards to ML service,
  * stores results (MongoDB or in-memory), serves dashboard API.
+ *
+ * Improvements:
+ *  - Input validation & sanitization on /api/analyze
+ *  - Rate limiting on write endpoints (express-rate-limit)
+ *  - /api/stats/realtime for per-second packet rate
+ *  - Graceful SIGTERM/SIGINT shutdown
  */
 
 require("dotenv").config();
-const express  = require("express");
-const cors     = require("cors");
-const morgan   = require("morgan");
-const axios    = require("axios");
-const mongoose = require("mongoose");
+const express    = require("express");
+const cors       = require("cors");
+const morgan     = require("morgan");
+const axios      = require("axios");
+const mongoose   = require("mongoose");
 const nodemailer = require("nodemailer");
-const fs = require("fs");
-const path = require("path");
-const { spawn } = require("child_process");
-const crypto = require("crypto");
+const fs         = require("fs");
+const path       = require("path");
+const { spawn }  = require("child_process");
+const crypto     = require("crypto");
 const { v4: uuidv4 } = require("uuid");
+
+// Optional rate-limiter (gracefully skipped if not installed)
+let rateLimit;
+try { rateLimit = require("express-rate-limit"); } catch { rateLimit = null; }
+
+// Optional compression (gracefully skipped if not installed)
+let compression;
+try { compression = require("compression"); } catch { compression = null; }
 
 // ── Config ────────────────────────────────────────────────────────────────────
 const PORT       = process.env.PORT           || 3001;
@@ -35,6 +49,7 @@ const allowedOrigins = (process.env.CORS_ALLOWED_ORIGINS || "http://localhost:51
   .filter(Boolean);
 
 const app = express();
+if (compression) app.use(compression());
 app.use(cors({
   origin(origin, callback) {
     if (!origin) return callback(null, true);
@@ -46,6 +61,111 @@ app.use(cors({
 }));
 app.use(express.json({ limit: "5mb" }));
 app.use(morgan("tiny"));
+
+// ── Rate limiting on write routes ─────────────────────────────────────────────
+const analyzeRateLimiter = rateLimit
+  ? rateLimit({
+      windowMs: 60_000,
+      max: 600,          // 600 packets/min per IP
+      standardHeaders: true,
+      legacyHeaders: false,
+      message: { error: "Too many requests — rate limit exceeded" },
+    })
+  : (_req, _res, next) => next();
+
+const demoRateLimiter = rateLimit
+  ? rateLimit({
+      windowMs: 60_000,
+      max: 5,
+      standardHeaders: true,
+      legacyHeaders: false,
+      message: { error: "Demo start requests are rate-limited" },
+    })
+  : (_req, _res, next) => next();
+
+// ── Input validation helper ───────────────────────────────────────────────────
+function clamp(val, min, max) {
+  const n = Number(val);
+  if (!isFinite(n)) return min;
+  return Math.min(Math.max(n, min), max);
+}
+
+/**
+ * Sanitize and clamp packet feature fields to valid ranges.
+ * Returns the cleaned packet object.
+ */
+function sanitizePacket(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+
+  const numericRanges = {
+    duration:                    [0, 58329],
+    src_bytes:                   [0, 1.38e9],
+    dst_bytes:                   [0, 1.31e9],
+    land:                        [0, 1],
+    wrong_fragment:              [0, 3],
+    urgent:                      [0, 14],
+    hot:                         [0, 101],
+    num_failed_logins:           [0, 5],
+    logged_in:                   [0, 1],
+    num_compromised:             [0, 7479],
+    root_shell:                  [0, 1],
+    su_attempted:                [0, 2],
+    num_root:                    [0, 7468],
+    num_file_creations:          [0, 100],
+    num_shells:                  [0, 5],
+    num_access_files:            [0, 9],
+    num_outbound_cmds:           [0, 0],
+    is_host_login:               [0, 1],
+    is_guest_login:              [0, 1],
+    count:                       [0, 511],
+    srv_count:                   [0, 511],
+    serror_rate:                 [0, 1],
+    srv_serror_rate:             [0, 1],
+    rerror_rate:                 [0, 1],
+    srv_rerror_rate:             [0, 1],
+    same_srv_rate:               [0, 1],
+    diff_srv_rate:               [0, 1],
+    srv_diff_host_rate:          [0, 1],
+    dst_host_count:              [0, 255],
+    dst_host_srv_count:          [0, 255],
+    dst_host_same_srv_rate:      [0, 1],
+    dst_host_diff_srv_rate:      [0, 1],
+    dst_host_same_src_port_rate: [0, 1],
+    dst_host_srv_diff_host_rate: [0, 1],
+    dst_host_serror_rate:        [0, 1],
+    dst_host_srv_serror_rate:    [0, 1],
+    dst_host_rerror_rate:        [0, 1],
+    dst_host_srv_rerror_rate:    [0, 1],
+    src_port:                    [0, 65535],
+    dst_port:                    [0, 65535],
+    packet_length:               [0, 65535],
+  };
+
+  const cleaned = {};
+
+  for (const [key, [min, max]] of Object.entries(numericRanges)) {
+    if (key in raw) cleaned[key] = clamp(raw[key], min, max);
+  }
+
+  // String fields — strip to safe characters
+  const stringAllowlist = {
+    protocol_type: /^[a-z]{1,10}$/i,
+    service:       /^[a-z0-9_]{1,30}$/i,
+    flag:          /^[a-z0-9_]{1,10}$/i,
+    protocol:      /^[a-z]{1,10}$/i,
+    src_ip:        /^[0-9.:a-f]{1,45}$/i,
+    dst_ip:        /^[0-9.:a-f]{1,45}$/i,
+  };
+
+  for (const [key, pattern] of Object.entries(stringAllowlist)) {
+    if (key in raw) {
+      const s = String(raw[key] ?? "").trim();
+      cleaned[key] = pattern.test(s) ? s : undefined;
+    }
+  }
+
+  return cleaned;
+}
 
 function hasValidApiKey(req) {
   const provided = req.get("x-api-key") || "";
@@ -620,7 +740,9 @@ app.get("/api/alerts/status", (_req, res) => {
 });
 
 // ── POST /api/analyze — receive packet + classify ─────────────────────────────
-app.post("/api/analyze", requireApiKey, async (req, res) => {
+app.post("/api/analyze", requireApiKey, analyzeRateLimiter, async (req, res) => {
+  // Sanitize input
+  req.body = sanitizePacket(req.body);
   try {
     const packet = req.body;
 
@@ -732,12 +854,44 @@ app.get("/api/stats/history", (_req, res) => {
   res.json({ history: stats.history });
 });
 
+// ── GET /api/stats/realtime ─────────────────────────────────────────────────
+// Returns per-second packet rate averaged over the last 10 seconds
+const realtimeWindow = [];
+setInterval(() => {
+  const now = Date.now();
+  realtimeWindow.push({ time: now, total: stats.total, attacks: stats.attacks });
+  // Keep last 60 ticks (60 seconds)
+  if (realtimeWindow.length > 60) realtimeWindow.shift();
+}, 1000);
+
+app.get("/api/stats/realtime", (_req, res) => {
+  const now = Date.now();
+  const windowMs = 10_000;
+  const windowPoints = realtimeWindow.filter(p => (now - p.time) <= windowMs);
+  let packetsPerSecond  = 0;
+  let attacksPerSecond  = 0;
+  if (windowPoints.length >= 2) {
+    const oldest = windowPoints[0];
+    const newest = windowPoints[windowPoints.length - 1];
+    const secs   = Math.max((newest.time - oldest.time) / 1000, 1);
+    packetsPerSecond  = parseFloat(((newest.total  - oldest.total)  / secs).toFixed(2));
+    attacksPerSecond  = parseFloat(((newest.attacks - oldest.attacks) / secs).toFixed(2));
+  }
+  res.json({
+    packets_per_second:  packetsPerSecond,
+    attacks_per_second:  attacksPerSecond,
+    window_seconds:      10,
+    total_packets:       stats.total,
+    attack_packets:      stats.attacks,
+  });
+});
+
 // ── Demo controls ────────────────────────────────────────────────────────────
 app.get("/api/demo/status", (_req, res) => {
   res.json(getDemoStatus());
 });
 
-app.post("/api/demo/start", requireApiKey, (req, res) => {
+app.post("/api/demo/start", requireApiKey, demoRateLimiter, (req, res) => {
   try {
     const duration = Math.max(15, Math.min(Number(req.body.duration) || 90, 900));
     const rate = Math.max(0.5, Math.min(Number(req.body.rate) || 2, 20));
@@ -757,10 +911,38 @@ app.post("/api/demo/stop", requireApiKey, (_req, res) => {
 });
 
 // ── Start ─────────────────────────────────────────────────────────────────────
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
   console.log(`\n🛡️  NIDS Backend running on http://localhost:${PORT}`);
   console.log(`   ML Service : ${ML_URL}`);
-  console.log(`   Storage    : ${usingMongo ? "MongoDB" : "in-memory"}\n`);
+  console.log(`   Storage    : ${usingMongo ? "MongoDB" : "in-memory"}`);
   const alertStatus = getAlertStatus();
-  console.log(`   Alerts     : ${alertStatus.enabled ? alertStatus.active_channels.join(", ") : "disabled"}\n`);
+  console.log(`   Alerts     : ${alertStatus.enabled ? alertStatus.active_channels.join(", ") : "disabled"}`);
+  console.log(`   Rate limit : ${rateLimit ? "enabled" : "disabled (express-rate-limit not installed)"}\n`);
 });
+
+// ── Graceful shutdown ─────────────────────────────────────────────────────────
+function gracefulShutdown(signal) {
+  console.log(`\n${signal} received — shutting down gracefully …`);
+  stopDemo();
+  server.close(() => {
+    console.log("HTTP server closed.");
+    if (usingMongo) {
+      mongoose.connection.close(false)
+        .then(() => {
+          console.log("MongoDB connection closed.");
+          process.exit(0);
+        })
+        .catch((err) => {
+          console.error("Error closing MongoDB connection:", err.message);
+          process.exit(1);
+        });
+    } else {
+      process.exit(0);
+    }
+  });
+  // Force exit after 8s
+  setTimeout(() => { console.error("Forced exit."); process.exit(1); }, 8000);
+}
+
+process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
+process.on("SIGINT",  () => gracefulShutdown("SIGINT"));
